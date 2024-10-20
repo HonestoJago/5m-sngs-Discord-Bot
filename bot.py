@@ -1,20 +1,20 @@
 import os
-from dotenv import load_dotenv
-import discord
-from discord import ButtonStyle
-import asyncio
-from discord import app_commands
 import uuid
+import asyncio
 import logging
 from typing import Optional
+
+import discord
+from discord import ButtonStyle, app_commands
 from discord.ext import commands
+from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,  # Change this to DEBUG for more detailed logs
+    level=logging.INFO,  # Change to DEBUG for detailed logs during development
     format='%(asctime)s:%(levelname)s:%(name)s: %(message)s',
     handlers=[
         logging.FileHandler(filename='bot.log', encoding='utf-8', mode='a'),
@@ -23,16 +23,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Helper function to retrieve and validate environment variables
+def get_env_variable(var_name: str, cast_type, default=None):
+    value = os.getenv(var_name, default)
+    if value is None:
+        logger.error(f"Environment variable '{var_name}' is not set.")
+        raise ValueError(f"Environment variable '{var_name}' is not set.")
+    try:
+        return cast_type(value)
+    except ValueError:
+        logger.error(f"Environment variable '{var_name}' must be of type {cast_type.__name__}.")
+        raise ValueError(f"Environment variable '{var_name}' must be of type {cast_type.__name__}.")
+
+# Retrieve and validate environment variables
+DISCORD_BOT_TOKEN = get_env_variable('DISCORD_BOT_TOKEN', str)
+DESIGNATED_CHANNELS = get_env_variable('DESIGNATED_CHANNELS', lambda x: list(map(int, x.split(','))))
+TEST_MODE = get_env_variable('TEST_MODE', lambda x: x.lower() == 'true', default=False)
+ADMIN_USER_ID = get_env_variable('ADMIN_USER_ID', int)
+PIN_BOT_ID = get_env_variable('PIN_BOT_ID', int)
+ROLE_ID = get_env_variable('ROLE_ID', int)
+
 # Set up intents
 intents = discord.Intents.default()
-intents.members = True  # Enable members intent for role checks
-intents.message_content = True  # Enable message content intent
+intents.members = True  # Required for role checks
+intents.message_content = True  # Required to read message content
 
-# Add these new constants
-ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID'))  # Your user ID
-PIN_BOT_ID = int(os.getenv('PIN_BOT_ID'))  # Your pin bot's ID
-
-# Modify the client initialization
+# Custom Client with Command Tree
 class CustomClient(discord.Client):
     def __init__(self, *, intents: discord.Intents):
         super().__init__(intents=intents)
@@ -44,28 +60,17 @@ class CustomClient(discord.Client):
 client = CustomClient(intents=intents)
 tree = client.tree
 
+# Constants
 MAX_PLAYERS = 8
 sng_games = {}
 
-# Get designated channels from environment variable
-designated_channels_env = os.getenv('DESIGNATED_CHANNELS')
-if not designated_channels_env:
-    raise ValueError("DESIGNATED_CHANNELS environment variable is not set.")
-DESIGNATED_CHANNELS = list(map(int, designated_channels_env.split(',')))
-
-TEST_MODE = os.getenv('TEST_MODE', 'false').lower() == 'true'
-
-# Define the role name as a constant or from environment variable
-ROLE_NAME = os.getenv('ROLE_NAME', '5m-sngs')
-
-# Add this constant near the top of your file, with other constants
-ROLE_ID = 1295098347551592518
-
+# Check to ensure commands are used in designated channels
 def in_designated_channel():
     async def predicate(interaction: discord.Interaction):
         return interaction.channel_id in DESIGNATED_CHANNELS
     return app_commands.check(predicate)
 
+# UI Button Classes
 class PlayerButton(discord.ui.Button):
     def __init__(self, sng_id, slot):
         super().__init__(style=ButtonStyle.grey, label=f"Player {slot}", custom_id=f"player_{sng_id}_{slot}")
@@ -78,7 +83,7 @@ class PlayerButton(discord.ui.Button):
             await self.view.update_players(interaction, self.slot)
         except Exception as e:
             await interaction.response.send_message("An unexpected error occurred while updating players.", ephemeral=True)
-            logger.error(f"Unexpected error in PlayerButton callback for SNG {self.sng_id}, slot {self.slot}: {e}", exc_info=True)
+            logger.error(f"Error in PlayerButton callback for SNG {self.sng_id}, slot {self.slot}: {e}", exc_info=True)
 
 class StartSNGButton(discord.ui.Button):
     def __init__(self, sng_id):
@@ -90,7 +95,7 @@ class StartSNGButton(discord.ui.Button):
             await self.view.start_sng(interaction)
         except Exception as e:
             await interaction.response.send_message("An unexpected error occurred while starting the SNG.", ephemeral=True)
-            logger.error(f"Unexpected error in StartSNGButton callback for SNG {self.view.sng_id}: {e}", exc_info=True)
+            logger.error(f"Error in StartSNGButton callback for SNG {self.view.sng_id}: {e}", exc_info=True)
 
 class EndSNGButton(discord.ui.Button):
     def __init__(self, sng_id):
@@ -101,8 +106,7 @@ class EndSNGButton(discord.ui.Button):
         try:
             await self.view.end_sng(interaction)
         except Exception as e:
-            # Since we have deferred the interaction in end_sng, we cannot send a new response here
-            logger.error(f"Unexpected error in EndSNGButton callback for SNG {self.view.sng_id}: {e}", exc_info=True)
+            logger.error(f"Error in EndSNGButton callback for SNG {self.view.sng_id}: {e}", exc_info=True)
 
 class NotifyMeButton(discord.ui.Button):
     def __init__(self, sng_id):
@@ -114,34 +118,35 @@ class NotifyMeButton(discord.ui.Button):
             await self.view.toggle_notification(interaction)
         except Exception as e:
             await interaction.response.send_message("An unexpected error occurred while setting up notification.", ephemeral=True)
-            logger.error(f"Unexpected error in NotifyMeButton callback for SNG {self.view.sng_id}: {e}", exc_info=True)
+            logger.error(f"Error in NotifyMeButton callback for SNG {self.view.sng_id}: {e}", exc_info=True)
 
+# SNG View Class
 class SNGView(discord.ui.View):
     def __init__(self, sng_id, starter, channel_id):
         super().__init__(timeout=None)  # No timeout to keep the view alive
         self.sng_id = sng_id
         self.starter = starter
         self.channel_id = channel_id
-        self.message = None
-        self.message_id = None
-        self.start_message = None  # This will store the "Preparing to start SNG" message
-        self.notify_users = set()  # Set to store users who want notifications
+        self.message: Optional[discord.Message] = None  # GUI message
+        self.ping_message_id: Optional[int] = None  # Ping message
+        self.start_message: Optional[discord.Message] = None  # Start message
+        self.notify_users = set()
         self.last_activity = discord.utils.utcnow()
-        self.end_task = None  # Task to automatically end the SNG after it starts
-        self.inactivity_task = None  # Task to automatically end unstarted SNG after 1 hour
+        self.end_task: Optional[asyncio.Task] = None
+        self.inactivity_task: Optional[asyncio.Task] = asyncio.create_task(self.start_inactivity_timer())
+        self.game_messages = []  # List to track all game-related messages
 
+        # Add Player Buttons
         for i in range(1, MAX_PLAYERS + 1):
             button = PlayerButton(sng_id, i)
             if i == 1:
                 button.style = ButtonStyle.green
             self.add_item(button)
 
+        # Add Control Buttons
         self.add_item(StartSNGButton(sng_id))
         self.add_item(EndSNGButton(sng_id))
         self.add_item(NotifyMeButton(sng_id))
-
-        # Start the inactivity timer for unstarted SNGs
-        self.inactivity_task = asyncio.create_task(self.start_inactivity_timer())
 
     def create_embed(self):
         if self.sng_id in sng_games:
@@ -162,17 +167,19 @@ class SNGView(discord.ui.View):
         logger.info(f"Updating players for SNG {self.sng_id}")
         self.last_activity = discord.utils.utcnow()
         try:
-            if not sng_games[self.sng_id]['started']:
+            game = sng_games[self.sng_id]
+            if not game['started']:
                 await interaction.response.defer()
 
-                sng_games[self.sng_id]['players'] = slot
+                game['players'] = slot
 
-                for button in self.children:
-                    if isinstance(button, PlayerButton):
-                        button.style = ButtonStyle.green if button.slot <= slot else ButtonStyle.grey
+                # Update button styles
+                for child in self.children:
+                    if isinstance(child, PlayerButton):
+                        child.style = ButtonStyle.green if child.slot <= slot else ButtonStyle.grey
 
-                if sng_games[self.sng_id]['players'] == MAX_PLAYERS:
-                    sng_games[self.sng_id]['started'] = True
+                if game['players'] == MAX_PLAYERS:
+                    game['started'] = True
                     # Disable all buttons except End SNG
                     for child in self.children:
                         if not isinstance(child, EndSNGButton):
@@ -180,14 +187,16 @@ class SNGView(discord.ui.View):
 
                     await self.message.edit(view=self, embed=self.create_embed())
 
+                    # Send start message and track it
                     self.start_message = await interaction.followup.send(
-                        f"SNG {sng_games[self.sng_id]['display_id']} has automatically started with {MAX_PLAYERS} players!"
+                        f"SNG {game['display_id']} has automatically started with {MAX_PLAYERS} players!"
                     )
+                    self.game_messages.append(self.start_message)
 
                     logger.info(f"TEST_MODE is set to: {TEST_MODE}")
 
                     # Notify users who requested notifications
-                    await self.send_notifications(client, sng_games[self.sng_id]['display_id'])
+                    await self.send_notifications(client, game['display_id'])
 
                     # Start auto-end task
                     if self.end_task and not self.end_task.done():
@@ -226,9 +235,11 @@ class SNGView(discord.ui.View):
 
                 await self.message.edit(view=self, embed=self.create_embed())
 
+                # Send start message and track it
                 self.start_message = await interaction.followup.send(
                     f"SNG {game['display_id']} has been manually started with {game['players']} players!"
                 )
+                self.game_messages.append(self.start_message)
 
                 logger.info(f"TEST_MODE is set to: {TEST_MODE}")
 
@@ -268,40 +279,28 @@ class SNGView(discord.ui.View):
                 game = sng_games[self.sng_id]
 
                 # Cancel tasks
-                if not auto_ended:
-                    if self.end_task and not self.end_task.done():
-                        self.end_task.cancel()
-                        logger.info(f"Auto-end task cancelled for SNG {self.sng_id}")
-                    if self.inactivity_task and not self.inactivity_task.done():
-                        self.inactivity_task.cancel()
-                        logger.info(f"Inactivity timer cancelled for SNG {self.sng_id}")
+                if self.end_task and not self.end_task.done():
+                    self.end_task.cancel()
+                    logger.info(f"Auto-end task cancelled for SNG {self.sng_id}")
+                if self.inactivity_task and not self.inactivity_task.done():
+                    self.inactivity_task.cancel()
+                    logger.info(f"Inactivity timer cancelled for SNG {self.sng_id}")
 
-                # Remove the reference to the view
+                # Remove the game from active games
                 del sng_games[self.sng_id]
                 logger.info(f"SNG {self.sng_id} removed from active games.")
 
-                # Delete the GUI message
-                if self.message:
+                # Delete all tracked game-related messages
+                for msg in self.game_messages:
                     try:
-                        logger.info(f"Attempting to delete GUI message for SNG {self.sng_id}")
-                        await self.message.delete()
-                        logger.info(f"GUI message deleted for SNG {self.sng_id}")
+                        await msg.delete()
+                        logger.info(f"Deleted message ID {msg.id} related to SNG {self.sng_id}")
                     except discord.errors.NotFound:
-                        logger.warning(f"GUI message for SNG {self.sng_id} already deleted or not found")
+                        logger.warning(f"Message ID {msg.id} already deleted or not found for SNG {self.sng_id}")
+                    except discord.errors.Forbidden:
+                        logger.warning(f"Insufficient permissions to delete message ID {msg.id} for SNG {self.sng_id}")
                     except Exception as e:
-                        logger.error(f"Failed to delete GUI message: {e}", exc_info=True)
-
-                # Delete any other bot messages related to this SNG
-                if self.channel_id:
-                    channel = client.get_channel(self.channel_id)
-                    if channel:
-                        async for message in channel.history(limit=100):
-                            if message.author == client.user and (self.sng_id in message.content or game['display_id'] in message.content):
-                                try:
-                                    await message.delete()
-                                    logger.info(f"Deleted related message for SNG {self.sng_id}")
-                                except Exception as e:
-                                    logger.error(f"Failed to delete related message: {e}", exc_info=True)
+                        logger.error(f"Failed to delete message ID {msg.id} for SNG {self.sng_id}: {e}", exc_info=True)
 
                 # Send confirmation message only if not auto-ended
                 if not auto_ended:
@@ -311,7 +310,8 @@ class SNGView(discord.ui.View):
                         else:
                             channel = client.get_channel(self.channel_id)
                             if channel:
-                                await channel.send(f"SNG {game['display_id']} has been ended.", delete_after=10)
+                                confirmation = await channel.send(f"SNG {game['display_id']} has been ended.", delete_after=10)
+                                self.game_messages.append(confirmation)
                             else:
                                 logger.error(f"Channel is None; cannot send confirmation message for SNG {self.sng_id}")
                     except Exception as e:
@@ -334,8 +334,13 @@ class SNGView(discord.ui.View):
             logger.error(f"Error in end_sng: {e}", exc_info=True)
 
     async def ping_channel(self, interaction: discord.Interaction):
-        temp_message = await interaction.channel.send("Updating SNG status...")
-        await temp_message.delete()
+        try:
+            temp_message = await interaction.channel.send("Updating SNG status...")
+            self.game_messages.append(temp_message)
+            await temp_message.delete()
+            logger.info("Temporary 'Updating SNG status...' message deleted.")
+        except Exception as e:
+            logger.error(f"Failed to ping channel: {e}", exc_info=True)
 
     async def auto_end_sng(self):
         logger.info(f"Auto-end task started for SNG {self.sng_id}")
@@ -371,12 +376,12 @@ class SNGView(discord.ui.View):
             user_id = interaction.user.id
             if user_id in self.notify_users:
                 self.notify_users.remove(user_id)
-                await interaction.response.send_message("You will no longer be notified when this game starts.", ephemeral=True)
+                await interaction.response.send_message("You will no longer be notified when this game is created.", ephemeral=True)
+                logger.info(f"User {user_id} removed from notification list for SNG {self.sng_id}")
             else:
                 self.notify_users.add(user_id)
-                await interaction.response.send_message("You will be notified when this game starts.", ephemeral=True)
-
-            logger.info(f"User {user_id} toggled notifications for game {self.sng_id}. Current notify list: {self.notify_users}")
+                await interaction.response.send_message("You will be notified when this game is created.", ephemeral=True)
+                logger.info(f"User {user_id} added to notification list for SNG {self.sng_id}")
 
             # Update the embed to reflect the new notification count
             await self.message.edit(embed=self.create_embed(), view=self)
@@ -388,17 +393,22 @@ class SNGView(discord.ui.View):
         for user_id in self.notify_users:
             try:
                 user = await client.fetch_user(user_id)
-                await user.send(f"The SNG game {game_id} has started!")
+                await user.send(f"The SNG game {game_id} has been created!")
                 logger.info(f"Notification sent to user {user.id} for game {game_id}")
             except discord.HTTPException as e:
                 logger.warning(f"Failed to send DM to user {user_id}. Error: {e}")
             except Exception as e:
                 logger.error(f"Error while trying to notify user {user_id}: {e}", exc_info=True)
 
+# Slash Command to Start SNG
 @tree.command(name="start", description="Start a new 5M Sit-and-Go game")
-@app_commands.checks.has_any_role(ROLE_NAME)
+@app_commands.checks.has_any_role(ROLE_ID)  # Using ROLE_ID for role checks
 @in_designated_channel()
 async def start_sng(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used within a server.", ephemeral=True)
+        return
+
     sng_id = str(uuid.uuid4())
     display_id = sng_id[:8]  # Use the first 8 characters of the UUID as the display ID
     starter = interaction.user.name
@@ -419,26 +429,97 @@ async def start_sng(interaction: discord.Interaction):
     # Store the view in sng_games to prevent garbage collection
     sng_games[sng_id]['view'] = view
 
-    # Defer the response
+    # Defer the response to allow time for processing
     await interaction.response.defer()
 
     if TEST_MODE:
-        view.message = await interaction.followup.send("Test mode: Role mention skipped", embed=embed, view=view)
+        test_message = await interaction.followup.send("Test mode: Role mention skipped")
+        view.game_messages.append(test_message)
     else:
         role = interaction.guild.get_role(ROLE_ID)
         if role:
-            view.message = await interaction.followup.send(f"{role.mention}", embed=embed, view=view)
+            allowed_mentions = discord.AllowedMentions(roles=[role])
+            try:
+                logger.debug(f"Attempting to mention role {role.name} with ID {ROLE_ID}")
+                ping_content = f"{role.mention} A new 5M SNG game has been created!"
+                logger.info(f"Sending ping message: {ping_content}")
+                
+                # Send the ping message separately
+                ping_message = await interaction.channel.send(
+                    ping_content,
+                    allowed_mentions=allowed_mentions
+                )
+                logger.info(f"Ping message sent for role {role.name} (ID: {role.id})")
+                view.game_messages.append(ping_message)
+            except discord.Forbidden:
+                logger.error(f"Permission denied: Cannot mention role ID {ROLE_ID}.")
+                await interaction.followup.send("Error: I don't have permission to mention the role. Starting game anyway.", ephemeral=True)
+            except discord.HTTPException as e:
+                logger.error(f"HTTP error occurred while sending ping: {e}")
+                await interaction.followup.send("Error: Failed to send the role mention due to an internal error. Starting game anyway.", ephemeral=True)
+            except Exception as e:
+                logger.error(f"Failed to send ping message: {e}", exc_info=True)
+                await interaction.followup.send("Failed to ping role. Starting game anyway.", ephemeral=True)
         else:
-            view.message = await interaction.followup.send(f"Role with ID {ROLE_ID} not found.", embed=embed, view=view)
+            logger.error(f"Role with ID {ROLE_ID} not found.")
+            await interaction.followup.send(
+                "Error: The specified role does not exist. Please contact an administrator.",
+                ephemeral=True
+            )
 
-    view.message_id = view.message.id if view.message else None
+    # Send the GUI embed and track it
+    gui_message = await interaction.followup.send(embed=embed, view=view)
+    view.message = gui_message
+    view.game_messages.append(gui_message)
 
     # Register the view to keep it alive
     client.add_view(view)
 
-    # Log the TEST_MODE status
+    # Log relevant information
     logger.info(f"TEST_MODE is set to: {TEST_MODE}")
+    logger.info(f"SNG started with ID: {sng_id}, Display ID: {display_id}")
+    logger.info(f"Starter: {starter}, Channel ID: {interaction.channel_id}")
 
+# **New Test Command to Ping the Role**
+@tree.command(name="test_ping", description="Test pinging the @5m-sngs role")
+@app_commands.checks.has_any_role(ROLE_ID)  # Restricting to roles that can ping
+@in_designated_channel()
+async def test_ping(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used within a server.", ephemeral=True)
+        return
+
+    role = interaction.guild.get_role(ROLE_ID)
+    if role:
+        allowed_mentions = discord.AllowedMentions(roles=[role])  # Correct: Passing Role object
+        try:
+            ping_content = f"{role.mention} This is a test ping!"
+            logger.info(f"Sending test ping message: {ping_content}")
+            await interaction.response.send_message(
+                ping_content,
+                allowed_mentions=allowed_mentions
+            )
+            # Retrieve the sent message to delete it after a delay
+            message = await interaction.original_response()
+            logger.info(f"Test ping message sent for role {role.name} (ID: {role.id})")
+            await message.delete(delay=5)  # Delete the test message after 5 seconds
+        except discord.Forbidden:
+            logger.error(f"Permission denied: Cannot mention role ID {ROLE_ID}.")
+            await interaction.followup.send("Error: I don't have permission to mention the role.", ephemeral=True)
+        except discord.HTTPException as e:
+            logger.error(f"HTTP error occurred while sending test ping: {e}")
+            await interaction.followup.send("Error: Failed to send the test role mention due to an internal error.", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Failed to send test ping message: {e}", exc_info=True)
+            await interaction.followup.send("Failed to ping role.", ephemeral=True)
+    else:
+        logger.error(f"Role with ID {ROLE_ID} not found.")
+        await interaction.response.send_message(
+            "Error: The specified role does not exist. Please contact an administrator.",
+            ephemeral=True
+        )
+
+# Event Handlers
 @client.event
 async def on_ready():
     logger.info(f'{client.user} has connected to Discord!')
@@ -456,6 +537,7 @@ async def on_disconnect():
 async def on_resume():
     logger.info("Bot has successfully reconnected to Discord.")
 
+# Error Handler for Slash Commands
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.errors.MissingAnyRole):
@@ -466,11 +548,11 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         await interaction.response.send_message(f"An error occurred: {error}", ephemeral=True)
     logger.error(f"An error occurred: {error}", exc_info=True)
 
-# Add this new event handler
+# Message Event to Delete Unauthorized Messages
 @client.event
 async def on_message(message):
     if message.channel.id in DESIGNATED_CHANNELS:
-        # Allow messages from the admin (you), the pin bot, and this bot itself
+        # Allow messages from the admin, pin bot, and this bot itself
         if message.author.id in [ADMIN_USER_ID, PIN_BOT_ID, client.user.id]:
             return
 
@@ -487,12 +569,6 @@ async def on_message(message):
         except Exception as e:
             logger.error(f"Error deleting message: {e}", exc_info=True)
 
-# Get the bot token from the environment variable
-bot_token = os.getenv('DISCORD_BOT_TOKEN')
-if not bot_token:
-    raise ValueError("DISCORD_BOT_TOKEN environment variable is not set.")
-
-# Add this near the end of your file, just before client.run(bot_token)
+# Start the Bot
 logger.info("Starting bot...")
-
-client.run(bot_token)
+client.run(DISCORD_BOT_TOKEN)
