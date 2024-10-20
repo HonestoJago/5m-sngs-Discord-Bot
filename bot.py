@@ -481,6 +481,10 @@ async def start_sng(interaction: discord.Interaction):
     logger.info(f"Starter: {starter}, Channel ID: {interaction.channel_id}")
 
 # **New Test Command to Ping the Role**
+'''
+Test ping function commented out after confirming role pinging works correctly in main functionality.
+Uncomment if further testing is needed in the future.
+
 @tree.command(name="test_ping", description="Test pinging the @5m-sngs role")
 @app_commands.checks.has_any_role(ROLE_ID)  # Restricting to roles that can ping
 @in_designated_channel()
@@ -518,6 +522,7 @@ async def test_ping(interaction: discord.Interaction):
             "Error: The specified role does not exist. Please contact an administrator.",
             ephemeral=True
         )
+'''
 
 # Event Handlers
 @client.event
