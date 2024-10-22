@@ -133,7 +133,7 @@ class SNGView(discord.ui.View):
         self.notify_users = set()
         self.last_activity = discord.utils.utcnow()
         self.end_task: Optional[asyncio.Task] = None
-        self.inactivity_task: Optional[asyncio.Task] = asyncio.create_task(self.start_inactivity_timer())
+        self.inactivity_task = asyncio.create_task(self.start_inactivity_timer())
         self.game_messages = []  # List to track all game-related messages
 
         # Add Player Buttons
@@ -225,7 +225,7 @@ class SNGView(discord.ui.View):
         try:
             await interaction.response.defer()
             game = sng_games[self.sng_id]
-            if game['players'] > 1 and not game['started']:
+            if game['players'] >= 2 and not game['started']:
                 game['started'] = True
 
                 # Disable all buttons except End SNG
@@ -233,7 +233,10 @@ class SNGView(discord.ui.View):
                     if not isinstance(child, EndSNGButton):
                         child.disabled = True
 
-                await self.message.edit(view=self, embed=self.create_embed())
+                if self.message:
+                    await self.message.edit(view=self, embed=self.create_embed())
+                else:
+                    logger.warning(f"self.message is None for SNG {self.sng_id}")
 
                 # Send start message and track it
                 self.start_message = await interaction.followup.send(
@@ -262,22 +265,20 @@ class SNGView(discord.ui.View):
             logger.error(f"Error in start_sng: {e}", exc_info=True)
 
     async def end_sng(self, interaction: Optional[discord.Interaction] = None, auto_ended: bool = False):
-        logger.info(f"Ending SNG {self.sng_id}")
+        logger.info(f"Ending SNG {self.sng_id} (auto_ended: {auto_ended})")
         self.last_activity = discord.utils.utcnow()
+        
         if interaction and interaction.channel_id != self.channel_id:
             return
+
         try:
             if interaction:
-                try:
+                # Check if the interaction response is already deferred
+                if not interaction.response.is_done():
                     await interaction.response.defer(ephemeral=True)
-                except Exception as e:
-                    logger.error(f"Failed to defer interaction: {e}", exc_info=True)
-            else:
-                logger.info("No interaction provided; proceeding without deferring.")
-
-            if self.sng_id in sng_games:
-                game = sng_games[self.sng_id]
-
+            
+            game = sng_games.get(self.sng_id)
+            if game:
                 # Cancel tasks
                 if self.end_task and not self.end_task.done():
                     self.end_task.cancel()
@@ -285,53 +286,59 @@ class SNGView(discord.ui.View):
                 if self.inactivity_task and not self.inactivity_task.done():
                     self.inactivity_task.cancel()
                     logger.info(f"Inactivity timer cancelled for SNG {self.sng_id}")
-
-                # Remove the game from active games
-                del sng_games[self.sng_id]
-                logger.info(f"SNG {self.sng_id} removed from active games.")
-
+                
                 # Delete all tracked game-related messages
                 for msg in self.game_messages:
                     try:
                         await msg.delete()
                         logger.info(f"Deleted message ID {msg.id} related to SNG {self.sng_id}")
-                    except discord.errors.NotFound:
-                        logger.warning(f"Message ID {msg.id} already deleted or not found for SNG {self.sng_id}")
-                    except discord.errors.Forbidden:
-                        logger.warning(f"Insufficient permissions to delete message ID {msg.id} for SNG {self.sng_id}")
                     except Exception as e:
                         logger.error(f"Failed to delete message ID {msg.id} for SNG {self.sng_id}: {e}", exc_info=True)
-
-                # Send confirmation message only if not auto-ended
-                if not auto_ended:
+                
+                # Delete the GUI message
+                if self.message:
                     try:
-                        if interaction:
-                            await interaction.followup.send(f"SNG {game['display_id']} has been ended.", ephemeral=True)
-                        else:
-                            channel = client.get_channel(self.channel_id)
-                            if channel:
-                                confirmation = await channel.send(f"SNG {game['display_id']} has been ended.", delete_after=10)
-                                self.game_messages.append(confirmation)
-                            else:
-                                logger.error(f"Channel is None; cannot send confirmation message for SNG {self.sng_id}")
+                        await self.message.delete()
+                        logger.info(f"Deleted GUI message for SNG {self.sng_id}")
                     except Exception as e:
-                        logger.error(f"Failed to send confirmation message: {e}", exc_info=True)
-
+                        logger.error(f"Failed to delete GUI message for SNG {self.sng_id}: {e}", exc_info=True)
+                else:
+                    logger.warning(f"No GUI message to delete for SNG {self.sng_id}")
+                
+                # Remove the game from active games
+                del sng_games[self.sng_id]
+                logger.info(f"SNG {self.sng_id} removed from active games.")
+                
+                # Send confirmation message
+                end_message = f"SNG {game['display_id']} has been {'automatically ' if auto_ended else ''}ended."
+                try:
+                    if interaction:
+                        await interaction.followup.send(end_message, ephemeral=True)
+                    else:
+                        channel = client.get_channel(self.channel_id)
+                        if channel:
+                            await channel.send(end_message, delete_after=10)
+                        else:
+                            logger.error(f"Channel is None; cannot send confirmation message for SNG {self.sng_id}")
+                except Exception as e:
+                    logger.error(f"Failed to send confirmation message: {e}", exc_info=True)
+                
                 # Log the end of the game
                 if interaction and interaction.user:
                     logger.info(f"SNG {game['display_id']} ended by {interaction.user.name}#{interaction.user.discriminator}")
                 else:
                     logger.info(f"SNG {game['display_id']} was automatically ended.")
             else:
+                logger.warning(f"Attempted to end SNG {self.sng_id}, but it was not found in active games.")
                 if interaction:
-                    try:
-                        await interaction.followup.send("This SNG has already been ended.", ephemeral=True)
-                    except Exception as e:
-                        logger.error(f"Failed to send follow-up message: {e}", exc_info=True)
-                else:
-                    logger.info(f"SNG {self.sng_id} has already been ended.")
+                    await interaction.followup.send("This SNG has already been ended.", ephemeral=True)
         except Exception as e:
             logger.error(f"Error in end_sng: {e}", exc_info=True)
+        
+        # Ensure the game is removed even if an exception occurs
+        if self.sng_id in sng_games:
+            del sng_games[self.sng_id]
+            logger.info(f"SNG {self.sng_id} forcibly removed from active games after error.")
 
     async def ping_channel(self, interaction: discord.Interaction):
         try:
@@ -347,11 +354,12 @@ class SNGView(discord.ui.View):
         try:
             await asyncio.sleep(300)  # 5 minutes before ending
             logger.info(f"Auto-end task waking up to end SNG {self.sng_id}")
-            await self.end_sng(auto_ended=True)
+            if self.sng_id in sng_games:
+                await self.end_sng(auto_ended=True)
+            else:
+                logger.info(f"SNG {self.sng_id} already ended before auto-end timer expired.")
         except asyncio.CancelledError:
-            # Task was cancelled
             logger.info(f"Auto-end task cancelled for SNG {self.sng_id}")
-            pass
         except Exception as e:
             logger.error(f"Error in auto_end_sng: {e}", exc_info=True)
 
@@ -363,9 +371,7 @@ class SNGView(discord.ui.View):
             if self.sng_id in sng_games and not sng_games[self.sng_id]['started']:
                 await self.end_sng(auto_ended=True)
         except asyncio.CancelledError:
-            # Task was cancelled
             logger.info(f"Inactivity timer cancelled for SNG {self.sng_id}")
-            pass
         except Exception as e:
             logger.error(f"Error in start_inactivity_timer: {e}", exc_info=True)
 
@@ -575,5 +581,8 @@ async def on_message(message):
             logger.error(f"Error deleting message: {e}", exc_info=True)
 
 # Start the Bot
-logger.info("Starting bot...")
-client.run(DISCORD_BOT_TOKEN)
+if __name__ == '__main__':
+    logger.info("Starting bot...")
+    client.run(DISCORD_BOT_TOKEN)
+else:
+    logger.info("Bot module imported, not starting client.")
