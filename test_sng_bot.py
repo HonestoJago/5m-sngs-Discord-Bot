@@ -1,6 +1,7 @@
+import discord
 import pytest
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch, call
 from discord import Interaction, Message, ButtonStyle
 from bot import SNGView, sng_games, MAX_PLAYERS, EndSNGButton, client
 
@@ -196,5 +197,216 @@ async def test_message_deletion_all_scenarios(sng_view, mock_interaction, mock_c
             assert call_count > 0, f"{scenario_name}: Message deletion not called"
 
     print("All scenarios tested successfully")
+
+# Add to existing imports
+from discord import Message, Interaction, ButtonStyle
+
+# Add new test scenarios
+@pytest.mark.asyncio
+async def test_end_game_scenarios(mock_interaction, mock_client):
+    """Test all scenarios that can end a game to ensure consistent cleanup."""
+    
+    # Add channel to mock_interaction
+    mock_interaction.channel = AsyncMock()
+    mock_interaction.channel.send = AsyncMock()
+    
+    scenarios = [
+        ("Manual end via button", lambda view: view.end_sng(mock_interaction)),
+        ("Auto-end after 5 minutes", lambda view: view.auto_end_sng()),
+        ("Inactivity timeout", lambda view: view.start_inactivity_timer()),
+        ("Max players reached", lambda view: test_max_players_scenario(view, mock_interaction))
+    ]
+    
+    async def test_max_players_scenario(view, interaction):
+        # First update to max players
+        await view.update_players(interaction, MAX_PLAYERS)
+        
+        # Verify game started automatically
+        assert sng_games[view.sng_id]['started'] is True
+        
+        # Verify buttons disabled (except End SNG)
+        for child in view.children:
+            if not isinstance(child, EndSNGButton):
+                assert child.disabled
+                
+        # Verify auto-end task was created
+        assert view.end_task is not None
+        assert not view.end_task.done()
+        
+        # Simulate 5-minute timer completion
+        await view.auto_end_sng()
+        
+        # Verify cleanup
+        assert view.sng_id not in sng_games
+        assert view.message.delete.called
+        for msg in view.game_messages:
+            assert msg.delete.called
+    
+    for scenario_name, trigger_func in scenarios:
+        # Setup
+        sng_id = f"test_sng_{scenario_name}"
+        channel_id = 123456789
+        
+        # Create mock messages
+        gui_message = AsyncMock(spec=Message)
+        game_messages = [AsyncMock(spec=Message) for _ in range(3)]
+        
+        # Create view
+        view = SNGView(sng_id, "TestStarter", channel_id)
+        view.message = gui_message
+        view.game_messages = game_messages
+        
+        # Initialize game state
+        sng_games[sng_id] = {
+            'players': 1,
+            'started': False,
+            'starter': "TestStarter",
+            'display_id': "TEST123",
+            'view': view
+        }
+        
+        # Setup mock channel
+        channel = AsyncMock()
+        mock_client.get_channel.return_value = channel
+        
+        print(f"\nTesting {scenario_name}")
+        
+        # Setup interaction mocks
+        mock_interaction.response.defer = AsyncMock()
+        mock_interaction.followup.send = AsyncMock()
+        mock_interaction.response.is_done = AsyncMock(return_value=False)
+        
+        # Execute the end game scenario
+        with patch('bot.client', mock_client), \
+             patch('asyncio.sleep', new_callable=AsyncMock):  # Skip sleep delays
+            await trigger_func(view)
+            
+            # Verify cleanup
+            assert view.sng_id not in sng_games, f"{scenario_name}: Game not removed from sng_games"
+            assert gui_message.delete.called, f"{scenario_name}: GUI message not deleted"
+            for msg in game_messages:
+                assert msg.delete.called, f"{scenario_name}: Game message not deleted"
+        
+        # Clean up for next scenario
+        if sng_id in sng_games:
+            del sng_games[sng_id]
+
+@pytest.mark.asyncio
+async def test_message_deletion_retry_mechanism():
+    """Test that message deletion retries work correctly."""
+    
+    sng_id = "test_retry_sng"
+    channel_id = 123456789
+    view = SNGView(sng_id, "TestStarter", channel_id)
+    
+    # Mock message that fails first attempt but succeeds on retry
+    failing_message = AsyncMock(spec=Message)
+    failing_message.delete.side_effect = [
+        discord.HTTPException(AsyncMock(), {'code': 50027}),  # First attempt fails
+        None  # Second attempt succeeds
+    ]
+    
+    # Test retry mechanism
+    result = await view.delete_with_retry(failing_message, "test message")
+    
+    assert result is True
+    assert failing_message.delete.call_count == 2
+
+@pytest.mark.asyncio
+async def test_cleanup_order():
+    """Test that cleanup happens in the correct order."""
+    
+    # Create a wrapper class to track operations
+    class TrackedDict(dict):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.operations = []
+            
+        def __delitem__(self, key):
+            self.operations.append("game_removed")
+            super().__delitem__(key)
+    
+    # Replace sng_games with our tracked version
+    tracked_games = TrackedDict()
+    
+    sng_id = "test_cleanup_sng"
+    channel_id = 123456789
+    view = SNGView(sng_id, "TestStarter", channel_id)
+    
+    # Setup mocks
+    gui_message = AsyncMock(spec=Message)
+    game_messages = [AsyncMock(spec=Message) for _ in range(3)]
+    view.message = gui_message
+    view.game_messages = game_messages
+    
+    # Initialize game state in our tracked dict
+    tracked_games[sng_id] = {
+        'players': 1,
+        'started': False,
+        'starter': "TestStarter",
+        'display_id': "TEST123",
+        'view': view
+    }
+    
+    # Mock message deletions with different labels
+    async def mock_gui_delete():
+        tracked_games.operations.append("gui_deleted")
+        return True
+        
+    async def mock_game_message_delete():
+        tracked_games.operations.append("game_message_deleted")
+        return True
+        
+    # Set up delete behaviors
+    gui_message.delete = AsyncMock(side_effect=mock_gui_delete)
+    for msg in game_messages:
+        msg.delete = AsyncMock(side_effect=mock_game_message_delete)
+    
+    # Execute end game with our tracked dictionary
+    with patch('bot.sng_games', tracked_games):
+        await view.end_sng(auto_ended=True)
+        
+        # Verify all messages were deleted
+        assert gui_message.delete.called, "GUI message was not deleted"
+        for msg in game_messages:
+            assert msg.delete.called, "Game message was not deleted"
+            
+        # Verify game was removed
+        assert sng_id not in tracked_games, "Game was not removed from sng_games"
+        
+        # Verify order
+        print(f"Operation order: {tracked_games.operations}")
+        
+        # Verify all game messages were deleted
+        game_message_deletions = tracked_games.operations.count("game_message_deleted")
+        assert game_message_deletions == len(game_messages), "Not all game messages were deleted"
+        
+        # Verify GUI was deleted
+        assert "gui_deleted" in tracked_games.operations, "GUI was not deleted"
+        
+        # Verify game removal happened last
+        assert tracked_games.operations[-1] == "game_removed", "Game was not removed last"
+
+# Add test for delete_with_retry
+@pytest.mark.asyncio
+async def test_delete_with_retry():
+    """Test the delete_with_retry helper function."""
+    
+    sng_id = "test_retry_sng"
+    channel_id = 123456789
+    view = SNGView(sng_id, "TestStarter", channel_id)
+    
+    # Mock message that fails first attempt but succeeds on retry
+    failing_message = AsyncMock(spec=Message)
+    failing_message.delete.side_effect = [
+        discord.HTTPException(AsyncMock(), {'code': 50027}),  # First attempt fails
+        None  # Second attempt succeeds
+    ]
+    
+    # Test retry mechanism
+    result = await view.delete_with_retry(failing_message, "test message")
+    
+    assert result is True
+    assert failing_message.delete.call_count == 2
 
 print("Test file updated")
