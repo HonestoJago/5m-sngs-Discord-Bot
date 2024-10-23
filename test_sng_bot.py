@@ -409,4 +409,176 @@ async def test_delete_with_retry():
     assert result is True
     assert failing_message.delete.call_count == 2
 
+@pytest.mark.asyncio
+async def test_core_end_game_functionality():
+    """Test that _end_game handles all scenarios correctly."""
+    sng_id = "test_core_end"
+    channel_id = 123456789
+    view = SNGView(sng_id, "TestStarter", channel_id)
+    
+    # Setup mocks
+    gui_message = AsyncMock(spec=Message)
+    game_messages = [AsyncMock(spec=Message) for _ in range(3)]
+    view.message = gui_message
+    view.game_messages = game_messages
+    
+    # Initialize game state
+    sng_games[sng_id] = {
+        'players': 1,
+        'started': False,
+        'starter': "TestStarter",
+        'display_id': "TEST123",
+        'view': view
+    }
+    
+    # Track operation order
+    operations = []
+    
+    # Mock message deletions
+    async def mock_delete():
+        operations.append("message_deleted")
+        return True
+    
+    gui_message.delete = AsyncMock(side_effect=mock_delete)
+    for msg in game_messages:
+        msg.delete = AsyncMock(side_effect=mock_delete)
+    
+    # Execute core end game
+    success = await view._end_game(auto_ended=True)
+    
+    # Verify success
+    assert success is True, "End game operation should succeed"
+    
+    # Verify all messages were deleted
+    assert gui_message.delete.called, "GUI message not deleted"
+    for msg in game_messages:
+        assert msg.delete.called, "Game message not deleted"
+    
+    # Verify game was removed from active games
+    assert sng_id not in sng_games, "Game not removed from sng_games"
+    
+    # Verify order - all deletions before game removal
+    assert len(operations) == len(game_messages) + 1, "Not all messages were deleted"
+    assert operations.count("message_deleted") == len(game_messages) + 1, "Incorrect number of deletions"
+
+@pytest.mark.asyncio
+async def test_auto_end_timer():
+    """Test that auto-end timer works correctly."""
+    sng_id = "test_auto_end"
+    channel_id = 123456789
+    view = SNGView(sng_id, "TestStarter", channel_id)
+    
+    # Setup mocks
+    gui_message = AsyncMock(spec=Message)
+    game_messages = [AsyncMock(spec=Message) for _ in range(3)]
+    view.message = gui_message
+    view.game_messages = game_messages
+    
+    # Initialize game state
+    sng_games[sng_id] = {
+        'players': MAX_PLAYERS,
+        'started': True,
+        'starter': "TestStarter",
+        'display_id': "TEST123",
+        'view': view
+    }
+    
+    # Start auto-end timer
+    with patch('asyncio.sleep', new_callable=AsyncMock):
+        await view.auto_end_sng()
+        
+        # Verify game was ended
+        assert sng_id not in sng_games, "Game not removed after auto-end"
+        assert gui_message.delete.called, "GUI message not deleted after auto-end"
+        for msg in game_messages:
+            assert msg.delete.called, "Game message not deleted after auto-end"
+
+@pytest.mark.asyncio
+async def test_message_deletion_retry():
+    """Test message deletion retry mechanism."""
+    sng_id = "test_deletion_retry"
+    channel_id = 123456789
+    view = SNGView(sng_id, "TestStarter", channel_id)
+    
+    # Mock message that fails first attempt but succeeds on retry
+    message = AsyncMock(spec=Message)
+    message.delete.side_effect = [
+        discord.HTTPException(AsyncMock(), {'code': 50027}),  # First attempt fails
+        None  # Second attempt succeeds
+    ]
+    
+    # Test retry mechanism
+    success = await view.delete_with_retry(message, "test message")
+    
+    assert success is True, "Retry mechanism should succeed"
+    assert message.delete.call_count == 2, "Should retry once after failure"
+
+@pytest.mark.asyncio
+async def test_end_game_error_handling():
+    """Test error handling during game end."""
+    sng_id = "test_error_handling"
+    channel_id = 123456789
+    view = SNGView(sng_id, "TestStarter", channel_id)
+    
+    # Setup mocks that will fail to delete
+    gui_message = AsyncMock(spec=Message)
+    gui_message.delete.side_effect = discord.Forbidden(AsyncMock(), "No permission")
+    view.message = gui_message
+    
+    game_messages = [AsyncMock(spec=Message) for _ in range(3)]
+    for msg in game_messages:
+        msg.delete.side_effect = discord.NotFound(AsyncMock(), "Message not found")
+    view.game_messages = game_messages
+    
+    # Initialize game state
+    sng_games[sng_id] = {
+        'players': 1,
+        'started': False,
+        'starter': "TestStarter",
+        'display_id': "TEST123",
+        'view': view
+    }
+    
+    # Execute end game
+    success = await view._end_game(auto_ended=True)
+    
+    # Verify behavior with errors
+    assert success is False, "Should return False when deletions fail"
+    assert sng_id in sng_games, "Game should not be removed if deletions fail"
+
+@pytest.mark.asyncio
+async def test_concurrent_end_attempts():
+    """Test handling of concurrent attempts to end the game."""
+    sng_id = "test_concurrent"
+    channel_id = 123456789
+    view = SNGView(sng_id, "TestStarter", channel_id)
+    
+    # Setup mocks
+    view.message = AsyncMock(spec=Message)
+    view.game_messages = [AsyncMock(spec=Message) for _ in range(3)]
+    
+    # Initialize game state
+    sng_games[sng_id] = {
+        'players': 1,
+        'started': False,
+        'starter': "TestStarter",
+        'display_id': "TEST123",
+        'view': view
+    }
+    
+    # Attempt to end game concurrently
+    async def end_game():
+        return await view._end_game(auto_ended=True)
+    
+    # Run multiple end attempts concurrently
+    results = await asyncio.gather(
+        end_game(),
+        end_game(),
+        return_exceptions=True
+    )
+    
+    # Verify only one attempt succeeded
+    success_count = sum(1 for r in results if r is True)
+    assert success_count == 1, "Only one end attempt should succeed"
+
 print("Test file updated")
