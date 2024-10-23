@@ -344,7 +344,7 @@ class SNGView(discord.ui.View):
         """Auto-end the SNG after timer expires."""
         logger.info(f"Auto-end task started for SNG {self.sng_id}")
         try:
-            await asyncio.sleep(30)  # 30 seconds for testing
+            await asyncio.sleep(180)  # Wait for 3 minutes
             logger.info(f"Auto-end task waking up to end SNG {self.sng_id}")
             if self.sng_id in sng_games:
                 await self._end_game(auto_ended=True)

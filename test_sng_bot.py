@@ -122,9 +122,7 @@ async def test_auto_end_game(sng_view, mock_client):
     for msg in sng_view.game_messages:
         assert msg.delete.called
 
-    # Check if a confirmation message was sent to the channel
-    assert channel.send.called
-    assert "automatically ended" in channel.send.call_args[0][0]
+    # No need to check for confirmation message anymore as it's been removed
 
 @pytest.mark.asyncio
 async def test_inactivity_timer(sng_view, mock_client):
@@ -150,9 +148,7 @@ async def test_inactivity_timer(sng_view, mock_client):
     for msg in sng_view.game_messages:
         assert msg.delete.called
 
-    # Check if a confirmation message was sent to the channel
-    assert channel.send.called
-    assert "automatically ended" in channel.send.call_args[0][0]
+    # No need to check for confirmation message anymore as it's been removed
 
 @pytest.mark.asyncio
 async def test_message_deletion_all_scenarios(sng_view, mock_interaction, mock_client):
@@ -582,3 +578,4 @@ async def test_concurrent_end_attempts():
     assert success_count == 1, "Only one end attempt should succeed"
 
 print("Test file updated")
+
