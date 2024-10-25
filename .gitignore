@@ -7,20 +7,54 @@ __pycache__/
 venv/
 env/
 ENV/
+.env/
+.venv/
 
 # Environment variables
 .env
+*.env
 
 # Logs
 *.log
+logs/
+log/
 
 # IDE specific files
 .vscode/
 .idea/
+*.swp
+*.swo
+*.swn
+.vs/
+*.sublime-workspace
+*.sublime-project
 
 # OS generated files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
 
 # Bot specific files
 bot.log
+config.json
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+coverage.xml
+*.cover
+
+# Specific test files
+test_sng_bot.py
+pytest.ini
