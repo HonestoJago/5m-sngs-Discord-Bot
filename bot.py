@@ -135,6 +135,10 @@ class SNGView(discord.ui.View):
         self.end_task: Optional[asyncio.Task] = None
         self.inactivity_task = asyncio.create_task(self.start_inactivity_timer())
         self.game_messages = []  # List to track all game-related messages
+        
+        # Add refresh task with better control
+        self._should_refresh = True  # Control flag for refresh loop
+        self.refresh_task = asyncio.create_task(self.periodic_refresh())
 
         # Add Player Buttons
         for i in range(1, MAX_PLAYERS + 1):
@@ -195,6 +199,24 @@ class SNGView(discord.ui.View):
                 if isinstance(child, PlayerButton):
                     child.style = ButtonStyle.green if child.slot <= slot else ButtonStyle.grey
 
+            # Try to edit the message, if it fails due to webhook token, send a new message
+            try:
+                await self.message.edit(view=self, embed=self.create_embed())
+            except discord.HTTPException as e:
+                if e.code == 50027:  # Invalid Webhook Token
+                    # Delete old message if possible
+                    try:
+                        await self.message.delete()
+                    except:
+                        pass
+                    
+                    # Send a new message
+                    new_message = await interaction.channel.send(embed=self.create_embed(), view=self)
+                    self.message = new_message
+                    self.game_messages.append(new_message)
+                else:
+                    raise  # Re-raise if it's a different error
+
             if game['players'] == MAX_PLAYERS:
                 game['started'] = True
                 # Disable all buttons except End SNG
@@ -234,7 +256,10 @@ class SNGView(discord.ui.View):
         except Exception as e:
             logger.error(f"Error in update_players: {e}", exc_info=True)
             try:
-                await interaction.followup.send(f"An error occurred: {str(e)}", ephemeral=True)
+                await interaction.followup.send(
+                    "An error occurred while updating the game. Please try ending this game and starting a new one.", 
+                    ephemeral=True
+                )
             except:
                 pass
 
@@ -248,6 +273,22 @@ class SNGView(discord.ui.View):
             game = sng_games[self.sng_id]
             if game['players'] >= 2 and not game['started']:
                 game['started'] = True
+                
+                # Stop refresh loop and cancel task
+                self._should_refresh = False
+                logger.info(f"Setting _should_refresh to False for SNG {self.sng_id}")
+                
+                # Cancel refresh task if it exists
+                if hasattr(self, 'refresh_task') and not self.refresh_task.done():
+                    self.refresh_task.cancel()
+                    try:
+                        await asyncio.wait_for(self.refresh_task, timeout=1.0)  # Wait up to 1 second for cancellation
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        pass
+                    logger.info(f"Refresh task cancelled for SNG {self.sng_id}")
+
+                # Verify refresh is stopped
+                assert not self._should_refresh, "Failed to stop refresh"
 
                 # Disable all buttons except End SNG
                 for child in self.children:
@@ -331,6 +372,12 @@ class SNGView(discord.ui.View):
                 except Exception as e:
                     logger.error(f"Error sending end confirmation: {e}", exc_info=True)
             
+            # Cancel refresh task when game ends
+            self._should_refresh = False  # Stop refresh loop
+            if hasattr(self, 'refresh_task') and not self.refresh_task.done():
+                self.refresh_task.cancel()
+                logger.info(f"Refresh task cancelled for SNG {self.sng_id}")
+
             return True
         else:
             logger.error(f"Failed to delete some messages for SNG {self.sng_id}")
@@ -458,6 +505,48 @@ class SNGView(discord.ui.View):
                     await asyncio.sleep(1)
                     continue
         return False
+
+    async def periodic_refresh(self):
+        """Periodically refresh the game message to prevent token expiration."""
+        try:
+            while self._should_refresh and self.sng_id in sng_games and not sng_games[self.sng_id]['started']:
+                await asyncio.sleep(600)  # Wait 10 minutes
+                
+                if not self._should_refresh or self.sng_id not in sng_games:
+                    break
+                    
+                channel = client.get_channel(self.channel_id)
+                if channel:
+                    try:
+                        # Try to edit first
+                        try:
+                            await self.message.edit(view=self, embed=self.create_embed())
+                            logger.info(f"Refreshed game message for SNG {self.sng_id}")
+                            continue
+                        except discord.HTTPException as e:
+                            if e.code != 50027:  # If not a token error, raise
+                                raise
+                        
+                        # If we get here, token was invalid - create new message
+                        try:
+                            await self.message.delete()
+                        except:
+                            pass
+                        
+                        new_message = await channel.send(embed=self.create_embed(), view=self)
+                        self.message = new_message
+                        self.game_messages.append(new_message)
+                        logger.info(f"Created new message for SNG {self.sng_id} during refresh")
+                        
+                    except Exception as e:
+                        logger.error(f"Error refreshing message for SNG {self.sng_id}: {e}", exc_info=True)
+                        
+        except asyncio.CancelledError:
+            logger.info(f"Refresh task cancelled for SNG {self.sng_id}")
+        except Exception as e:
+            logger.error(f"Error in periodic refresh for SNG {self.sng_id}: {e}", exc_info=True)
+        finally:
+            self._should_refresh = False
 
 # Slash Command to Start SNG
 @tree.command(name="start", description="Start a new 5M Sit-and-Go game")
