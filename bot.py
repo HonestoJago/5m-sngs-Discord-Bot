@@ -50,14 +50,22 @@ intents.message_content = True  # Required to read message content
 
 # Custom Client with Command Tree
 class CustomClient(discord.Client):
-    def __init__(self, *, intents: discord.Intents):
-        super().__init__(intents=intents)
+    """Enhanced Discord client with better connection handling"""
+    def __init__(self):
+        # Improved connection settings
+        super().__init__(
+            intents=intents,
+            heartbeat_timeout=150.0,    # Keep the improved connection settings
+            guild_ready_timeout=10.0,
+            gateway_queue_size=512
+        )
         self.tree = app_commands.CommandTree(self)
+        self.disconnect_count = 0  # Simple counter for logging
 
     async def setup_hook(self):
         await self.tree.sync()
 
-client = CustomClient(intents=intents)
+client = CustomClient()
 tree = client.tree
 
 # Constants
@@ -328,7 +336,6 @@ class SNGView(discord.ui.View):
 
     async def _end_game(self, auto_ended: bool = False, interaction: Optional[discord.Interaction] = None) -> bool:
         """Core game ending logic used by all end-game scenarios."""
-        
         logger.info(f"Ending SNG {self.sng_id} (auto_ended: {auto_ended})")
         
         # First, check if the game exists
@@ -336,52 +343,62 @@ class SNGView(discord.ui.View):
         if not game_info:
             logger.warning(f"Attempted to end SNG {self.sng_id}, but it was not found in active games.")
             if interaction:
-                await interaction.response.send_message("This game has already ended.", ephemeral=True)
+                try:
+                    if not interaction.response.is_done():
+                        await interaction.response.send_message("This game has already ended.", ephemeral=True)
+                except discord.NotFound:
+                    logger.info(f"Interaction expired while ending game {self.sng_id}")
+                except Exception as e:
+                    logger.error(f"Error responding to end game interaction: {e}")
             return False
 
-        # Delete all game-related messages first
+        # Delete messages and clean up
+        try:
+            deletion_successful = await self._cleanup_messages()
+            if deletion_successful:
+                await self._cleanup_game_state(game_info, interaction)
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Error during game cleanup: {e}", exc_info=True)
+            return False
+
+    async def _cleanup_messages(self) -> bool:
+        """Handle message deletion with proper logging."""
         deletion_successful = True
         
-        # Delete game messages first
         for msg in self.game_messages:
             if not await self.delete_with_retry(msg, "game message"):
                 deletion_successful = False
-        
-        # Delete GUI message
+                
         if not await self.delete_with_retry(self.message, "GUI message"):
             deletion_successful = False
+            
+        return deletion_successful
 
-        if deletion_successful:
-            # Only after successful deletion, remove game and clean up tasks
-            del sng_games[self.sng_id]
-            logger.info(f"SNG {self.sng_id} removed from active games after cleanup")
-            
-            # Cancel any running tasks
-            for task in [self.end_task, self.inactivity_task]:
-                if task and not task.done():
-                    task.cancel()
-                    logger.info(f"Cancelled task for SNG {self.sng_id}")
-            
-            # Send confirmation message only for manual end
-            if interaction:  # Only send message if manual end
-                try:
-                    if not interaction.response.is_done():
-                        await interaction.response.defer(ephemeral=True)
-                    await interaction.followup.send(f"SNG {game_info['display_id']} has been ended.", ephemeral=True)
-                    logger.info(f"SNG {game_info['display_id']} ended by {interaction.user}#{interaction.user.discriminator}")
-                except Exception as e:
-                    logger.error(f"Error sending end confirmation: {e}", exc_info=True)
-            
-            # Cancel refresh task when game ends
-            self._should_refresh = False  # Stop refresh loop
-            if hasattr(self, 'refresh_task') and not self.refresh_task.done():
-                self.refresh_task.cancel()
-                logger.info(f"Refresh task cancelled for SNG {self.sng_id}")
-
-            return True
-        else:
-            logger.error(f"Failed to delete some messages for SNG {self.sng_id}")
-            return False
+    async def _cleanup_game_state(self, game_info: dict, interaction: Optional[discord.Interaction]):
+        """Clean up game state and handle interaction response."""
+        del sng_games[self.sng_id]
+        logger.info(f"SNG {self.sng_id} removed from active games")
+        
+        # Cancel tasks
+        for task in [self.end_task, self.inactivity_task]:
+            if task and not task.done():
+                task.cancel()
+                
+        # Handle interaction response
+        if interaction:
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.defer(ephemeral=True)
+                await interaction.followup.send(
+                    f"SNG {game_info['display_id']} has been ended.",
+                    ephemeral=True
+                )
+            except discord.NotFound:
+                logger.info(f"Interaction expired during cleanup for {self.sng_id}")
+            except Exception as e:
+                logger.error(f"Error sending cleanup confirmation: {e}")
 
     async def end_sng(self, interaction: Optional[discord.Interaction] = None, auto_ended: bool = False):
         """End game via manual button press or other direct call."""
@@ -684,11 +701,28 @@ async def on_ready():
 
 @client.event
 async def on_disconnect():
-    logger.warning("Bot has disconnected from Discord.")
+    client.disconnect_count += 1
+    logger.warning(
+        f"\nDisconnection #{client.disconnect_count}"
+        f"\nTime: {discord.utils.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"
+        f"\nActive Games: {len(sng_games)}"
+    )
+    # Log details of active games
+    for game_id, game in sng_games.items():
+        logger.warning(
+            f"- Game {game['display_id']}: "
+            f"{game['players']} players, "
+            f"{'Started' if game['started'] else 'Not Started'}, "
+            f"Started by {game['starter']}"
+        )
 
 @client.event
 async def on_resume():
-    logger.info("Bot has successfully reconnected to Discord.")
+    logger.info(
+        f"\nConnection Resumed"
+        f"\nTime: {discord.utils.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"
+        f"\nChecking {len(sng_games)} active games..."
+    )
 
 # Error Handler for Slash Commands
 @tree.error
