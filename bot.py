@@ -88,10 +88,14 @@ class PlayerButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         logger.info(f"PlayerButton clicked by {interaction.user} for SNG {self.view.sng_id}, slot {self.slot}")
         try:
-            await self.view.update_players(interaction, self.slot)
+            async with self.view._is_refreshing:
+                await self.view.update_players(interaction, self.slot)
         except Exception as e:
-            await interaction.response.send_message("An unexpected error occurred while updating players.", ephemeral=True)
-            logger.error(f"Error in PlayerButton callback for SNG {self.sng_id}, slot {self.slot}: {e}", exc_info=True)
+            await interaction.response.send_message(
+                "An unexpected error occurred while updating players.",
+                ephemeral=True
+            )
+            logger.error(f"Error in PlayerButton callback: {e}", exc_info=True)
 
 class StartSNGButton(discord.ui.Button):
     def __init__(self, sng_id):
@@ -100,10 +104,14 @@ class StartSNGButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         logger.info(f"StartSNGButton clicked by {interaction.user} for SNG {self.view.sng_id}")
         try:
-            await self.view.start_sng(interaction)
+            async with self.view._is_refreshing:
+                await self.view.start_sng(interaction)
         except Exception as e:
-            await interaction.response.send_message("An unexpected error occurred while starting the SNG.", ephemeral=True)
-            logger.error(f"Error in StartSNGButton callback for SNG {self.view.sng_id}: {e}", exc_info=True)
+            await interaction.response.send_message(
+                "An unexpected error occurred while starting the SNG.",
+                ephemeral=True
+            )
+            logger.error(f"Error in StartSNGButton callback: {e}", exc_info=True)
 
 class EndSNGButton(discord.ui.Button):
     def __init__(self, sng_id):
@@ -112,9 +120,10 @@ class EndSNGButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         logger.info(f"EndSNGButton clicked by {interaction.user} for SNG {self.view.sng_id}")
         try:
-            await self.view.end_sng(interaction)
+            async with self.view._is_refreshing:
+                await self.view.end_sng(interaction)
         except Exception as e:
-            logger.error(f"Error in EndSNGButton callback for SNG {self.view.sng_id}: {e}", exc_info=True)
+            logger.error(f"Error in EndSNGButton callback: {e}", exc_info=True)
 
 class NotifyMeButton(discord.ui.Button):
     def __init__(self, sng_id):
@@ -123,29 +132,38 @@ class NotifyMeButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         logger.info(f"NotifyMeButton clicked by {interaction.user} for SNG {self.view.sng_id}")
         try:
-            await self.view.toggle_notification(interaction)
+            async with self.view._is_refreshing:
+                await self.view.toggle_notification(interaction)
         except Exception as e:
-            await interaction.response.send_message("An unexpected error occurred while setting up notification.", ephemeral=True)
-            logger.error(f"Error in NotifyMeButton callback for SNG {self.view.sng_id}: {e}", exc_info=True)
+            await interaction.response.send_message(
+                "An error occurred while toggling notifications.",
+                ephemeral=True
+            )
+            logger.error(f"Error in NotifyMeButton callback: {e}", exc_info=True)
 
 # SNG View Class
 class SNGView(discord.ui.View):
     def __init__(self, sng_id, starter, channel_id):
-        super().__init__(timeout=None)  # No timeout to keep the view alive
+        super().__init__(timeout=None)
         self.sng_id = sng_id
         self.starter = starter
         self.channel_id = channel_id
-        self.message: Optional[discord.Message] = None  # GUI message
-        self.ping_message_id: Optional[int] = None  # Ping message
-        self.start_message: Optional[discord.Message] = None  # Start message
+        self.message: Optional[discord.Message] = None
+        self.ping_message_id: Optional[int] = None
+        self.start_message: Optional[discord.Message] = None
         self.notify_users = set()
         self.last_activity = discord.utils.utcnow()
         self.end_task: Optional[asyncio.Task] = None
-        self.inactivity_task = asyncio.create_task(self.start_inactivity_timer())
-        self.game_messages = []  # List to track all game-related messages
+        self.game_messages = []
         
-        # Add refresh task with better control
-        self._should_refresh = True  # Control flag for refresh loop
+        # Improved refresh control
+        self._refresh_interval = 300  # 5 minutes
+        self._refresh_event = asyncio.Event()  # For controlled stopping
+        self._is_refreshing = asyncio.Lock()  # For atomic refresh operations
+        self._should_refresh = True
+        
+        # Start tasks
+        self.inactivity_task = asyncio.create_task(self.start_inactivity_timer())
         self.refresh_task = asyncio.create_task(self.periodic_refresh())
 
         # Add Player Buttons
@@ -381,8 +399,8 @@ class SNGView(discord.ui.View):
         del sng_games[self.sng_id]
         logger.info(f"SNG {self.sng_id} removed from active games")
         
-        # Cancel tasks
-        for task in [self.end_task, self.inactivity_task]:
+        # Cancel tasks - should include refresh_task
+        for task in [self.end_task, self.inactivity_task, self.refresh_task]:  # Add refresh_task
             if task and not task.done():
                 task.cancel()
                 
@@ -402,6 +420,12 @@ class SNGView(discord.ui.View):
 
     async def end_sng(self, interaction: Optional[discord.Interaction] = None, auto_ended: bool = False):
         """End game via manual button press or other direct call."""
+        # Stop refresh before ending game
+        self._should_refresh = False
+        if self.refresh_task and not self.refresh_task.done():
+            self.refresh_task.cancel()
+            logger.info(f"Refresh task cancelled for SNG {self.sng_id}")
+        
         await self._end_game(auto_ended=auto_ended, interaction=interaction)
 
     async def auto_end_sng(self):
@@ -524,46 +548,78 @@ class SNGView(discord.ui.View):
         return False
 
     async def periodic_refresh(self):
-        """Periodically refresh the game message to prevent token expiration."""
+        """Periodically refresh the game message with better control."""
         try:
             while self._should_refresh and self.sng_id in sng_games and not sng_games[self.sng_id]['started']:
-                await asyncio.sleep(600)  # Wait 10 minutes
+                try:
+                    # Wait for either the interval or cancellation
+                    await asyncio.wait_for(self._refresh_event.wait(), timeout=self._refresh_interval)
+                    if not self._should_refresh:
+                        break
+                except asyncio.TimeoutError:
+                    # Normal timeout - do the refresh
+                    pass
                 
-                if not self._should_refresh or self.sng_id not in sng_games:
-                    break
+                async with self._is_refreshing:
+                    logger.info(f"Starting refresh cycle for game {self.sng_id}")
+                    await self._do_refresh()
                     
-                channel = client.get_channel(self.channel_id)
-                if channel:
-                    try:
-                        # Try to edit first
-                        try:
-                            await self.message.edit(view=self, embed=self.create_embed())
-                            logger.info(f"Refreshed game message for SNG {self.sng_id}")
-                            continue
-                        except discord.HTTPException as e:
-                            if e.code != 50027:  # If not a token error, raise
-                                raise
-                        
-                        # If we get here, token was invalid - create new message
-                        try:
-                            await self.message.delete()
-                        except:
-                            pass
-                        
-                        new_message = await channel.send(embed=self.create_embed(), view=self)
-                        self.message = new_message
-                        self.game_messages.append(new_message)
-                        logger.info(f"Created new message for SNG {self.sng_id} during refresh")
-                        
-                    except Exception as e:
-                        logger.error(f"Error refreshing message for SNG {self.sng_id}: {e}", exc_info=True)
-                        
         except asyncio.CancelledError:
             logger.info(f"Refresh task cancelled for SNG {self.sng_id}")
-        except Exception as e:
-            logger.error(f"Error in periodic refresh for SNG {self.sng_id}: {e}", exc_info=True)
         finally:
             self._should_refresh = False
+            logger.info(f"Refresh task completed for SNG {self.sng_id}")
+
+    async def _do_refresh(self):
+        """Perform the actual refresh operation atomically."""
+        try:
+            embed = self.create_embed()
+            embed.set_footer(text="🔄 Refreshing...")
+            
+            # Try to edit existing message
+            try:
+                await self.message.edit(embed=embed, view=self)
+                logger.info(f"Refreshed message for game {self.sng_id}")
+                
+                # Remove refresh indicator
+                embed = self.create_embed()
+                await self.message.edit(embed=embed)
+                return True
+                
+            except discord.HTTPException as e:
+                if e.code != 50027:  # Not a token error
+                    raise
+                    
+            # Token expired - create new message
+            channel = client.get_channel(self.channel_id)
+            if not channel:
+                logger.error(f"Could not find channel for game {self.sng_id}")
+                return False
+                
+            # Create new message
+            new_message = await channel.send(
+                content="🔄 Refreshing game interface...",
+                embed=self.create_embed(),
+                view=self
+            )
+            
+            # Update references
+            old_message = self.message
+            self.message = new_message
+            
+            # Update game_messages list
+            if old_message in self.game_messages:
+                self.game_messages.remove(old_message)
+            self.game_messages.append(new_message)
+            
+            # Remove refresh indicator
+            await new_message.edit(content=None)
+            logger.info(f"Created new message for game {self.sng_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Refresh failed: {e}")
+            return False
 
 # Slash Command to Start SNG
 @tree.command(name="start", description="Start a new 5M Sit-and-Go game")
